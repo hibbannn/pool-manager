@@ -4,3 +4,4 @@ testdata/*
 .DS_Store
 *.tar.gz
 *.dic
+doc/*
