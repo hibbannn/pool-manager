@@ -9,6 +9,8 @@ const (
 	ErrPoolDoesNotExist          = "pool does not exist: "           // Error untuk pool yang tidak ditemukan
 	ErrInvalidShardedPoolType    = "pool is not sharded as expected" // Error untuk tipe pool yang tidak sesuai dengan sharding
 	ErrInvalidNonShardedPoolType = "pool is not a valid sync.Pool"   // Error untuk pool yang bukan tipe sync.Pool
+	ErrInvalidPoolConfigType     = "invalid pool config type"        // Error untuk konfigurasi pool yang tidak valid
+	ErrInvalidFactoryType        = "invalid factory type"            // Error untuk tipe factory yang tidak valid
 )
 
 // PoolError adalah tipe error khusus yang digunakan untuk mencatat kesalahan pada operasi PoolManager

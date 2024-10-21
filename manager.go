@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -96,6 +95,36 @@ func (pm *PoolManager) AddPool(poolType string, factory func() PoolAble, config 
 // poolType: tipe pool tempat mengambil instance
 // Mengembalikan objek PoolAble dan error jika terjadi kesalahan
 func (pm *PoolManager) AcquireInstance(poolType string) (PoolAble, error) {
+	// Ambil konfigurasi pool
+	configVal, _ := pm.poolConfig.Load(poolType)
+	conf, ok := configVal.(PoolConfig)
+	if !ok {
+		err := NewPoolError(poolType, "acquire", errors.New(ErrInvalidPoolConfigType))
+		pm.handleError(poolType, err)
+		return nil, err
+	}
+
+	// Coba mengambil dari cache terlebih dahulu jika caching diaktifkan
+	if conf.EnableCaching {
+		if cachedInstance, found := pm.cache.Load(poolType); found {
+			if poolAbleInstance, ok := cachedInstance.(PoolAble); ok {
+				// Perbarui metadata saat instance diambil dari cache
+				pm.safelyUpdateMetadata(poolType, func(metadata *PoolItemMetadata) {
+					metadata.LastUsed = time.Now()
+					metadata.Frequency++
+					metadata.Status = "Active"
+				})
+
+				pm.recordMetric(poolType, "cache_hit")
+				if conf.OnGet != nil {
+					conf.OnGet(poolType)
+				}
+				return poolAbleInstance, nil
+			}
+		}
+	}
+
+	// Jika tidak ada di cache, lanjutkan dengan pengambilan dari pool
 	pool, ok := pm.pools.Load(poolType)
 	if !ok {
 		err := NewPoolError(poolType, "acquire", errors.New(ErrPoolDoesNotExist+poolType))
@@ -103,32 +132,50 @@ func (pm *PoolManager) AcquireInstance(poolType string) (PoolAble, error) {
 		return nil, err
 	}
 
-	configVal, _ := pm.poolConfig.Load(poolType)
-	conf := configVal.(PoolConfig)
-
+	// Ambil instance dari pool, dengan dukungan untuk sharding jika diaktifkan
 	instance, err := pm.getInstanceFromPool(poolType, pool, conf)
 	if err != nil {
 		pm.handleError(poolType, err)
 		return nil, err
 	}
 
+	// Jika instance tidak ada di pool, buat instance baru menggunakan factory
 	if instance == nil {
 		factoryVal, _ := pm.instanceFactories.Load(poolType)
-		factory := factoryVal.(func() PoolAble)
+		factory, ok := factoryVal.(func() PoolAble)
+		if !ok {
+			err := NewPoolError(poolType, "acquire", errors.New(ErrInvalidFactoryType))
+			pm.handleError(poolType, err)
+			return nil, err
+		}
 		instance = factory()
 	}
 
+	// Cast instance menjadi PoolAble dan lakukan proses tambahan
 	if poolAbleInstance, ok := instance.(PoolAble); ok {
 		pm.recordMetric(poolType, "get")
+
+		// Tambahkan instance ke cache jika caching diaktifkan
 		if conf.EnableCaching {
-			pm.cache.Store(poolType, poolAbleInstance)
+			pm.addToCache(poolType, poolAbleInstance)
 		}
+
+		// Perbarui metadata saat instance diambil dari pool
+		pm.safelyUpdateMetadata(poolType, func(metadata *PoolItemMetadata) {
+			metadata.LastUsed = time.Now()
+			metadata.Frequency++
+			metadata.Status = "Active"
+		})
+
+		// Jalankan callback OnGet jika ada
 		if conf.OnGet != nil {
 			conf.OnGet(poolType)
 		}
+
 		return poolAbleInstance, nil
 	}
 
+	// Jika cast gagal, kembalikan error
 	err = NewPoolError(poolType, "acquire", errors.New("failed to cast instance to PoolAble"))
 	pm.handleError(poolType, err)
 	return nil, err
@@ -147,13 +194,13 @@ func (pm *PoolManager) getInstanceFromPool(poolType string, pool interface{}, co
 		}
 		shardIndex := pm.getShardIndex(poolType, conf, time.Now().String())
 		return shardedPools[shardIndex].Get(), nil
-	} else {
-		nonShardedPool, ok := pool.(*sync.Pool)
-		if !ok {
-			return nil, NewPoolError(poolType, "get", errors.New(ErrInvalidNonShardedPoolType))
-		}
-		return nonShardedPool.Get(), nil
 	}
+
+	nonShardedPool, ok := pool.(*sync.Pool)
+	if !ok {
+		return nil, NewPoolError(poolType, "get", errors.New(ErrInvalidNonShardedPoolType))
+	}
+	return nonShardedPool.Get(), nil
 }
 
 // ReleaseInstance mengembalikan instance ke pool dengan tipe tertentu
@@ -164,13 +211,22 @@ func (pm *PoolManager) ReleaseInstance(poolType string, instance PoolAble) error
 		return errors.New("cannot put nil instance into pool")
 	}
 
+	// Perbarui metadata saat instance dikembalikan
+	pm.safelyUpdateMetadata(poolType, func(metadata *PoolItemMetadata) {
+		metadata.LastUsed = time.Now()
+		metadata.Status = "Idle"
+	})
+
 	poolVal, ok := pm.pools.Load(poolType)
 	if !ok {
 		return errors.New(ErrPoolDoesNotExist + poolType)
 	}
 
 	configVal, _ := pm.poolConfig.Load(poolType)
-	conf := configVal.(PoolConfig)
+	conf, ok := configVal.(PoolConfig)
+	if !ok {
+		return errors.New(ErrInvalidPoolConfigType)
+	}
 
 	instance.Reset()
 
@@ -181,6 +237,12 @@ func (pm *PoolManager) ReleaseInstance(poolType string, instance PoolAble) error
 	}
 
 	pm.recordMetric(poolType, "put")
+
+	// Update cache jika caching diaktifkan
+	if conf.EnableCaching {
+		pm.addToCache(poolType, instance)
+	}
+
 	if conf.OnPut != nil {
 		conf.OnPut(poolType)
 	}
@@ -216,16 +278,11 @@ func (pm *PoolManager) putInstanceToPool(poolType string, pool interface{}, conf
 // conf: konfigurasi untuk pool yang digunakan
 // key: kunci yang digunakan untuk menghitung indeks shard
 func (pm *PoolManager) getShardIndex(poolType string, conf PoolConfig, key string) int {
-	switch conf.ShardStrategy {
-	case "round-robin":
-		return int(atomic.AddInt64(&pm.shardCounter, 1) % int64(conf.ShardCount))
-	case "random":
-		return rand.Intn(conf.ShardCount)
-	case "hash":
-		fallthrough
-	default:
-		return int(hashString(key) % uint32(conf.ShardCount))
+	if conf.ShardStrategy != nil {
+		return conf.ShardStrategy.GetShardIndex(poolType, conf.ShardCount, key)
 	}
+	// Default fallback jika ShardStrategy tidak diatur
+	return rand.Intn(conf.ShardCount)
 }
 
 // hashString menghitung nilai hash dari string menggunakan algoritma hash FNV-1a
@@ -256,4 +313,196 @@ func (pm *PoolManager) RemovePool(poolType string) error {
 	pm.itemMetadata.Delete(poolType)
 
 	return nil
+}
+
+// GetPoolSize mengembalikan ukuran pool saat ini
+func (pm *PoolManager) GetPoolSize(poolType string) int {
+	return pm.getPoolCurrentSize(poolType)
+}
+
+// GetShardSize mengembalikan ukuran shard tertentu
+func (pm *PoolManager) GetShardSize(poolType string, shardIndex int) int {
+	return pm.getShardCurrentSize(poolType, shardIndex)
+}
+
+func (pm *PoolManager) StartAutoTuning() {
+	if pm.autoTuneTicker == nil {
+		pm.autoTuneTicker = time.NewTicker(time.Minute) // Set interval auto-tuning
+		go func() {
+			for {
+				select {
+				case <-pm.autoTuneTicker.C:
+					pm.autoTunePoolSize()
+				case <-pm.autoTuneStop:
+					pm.autoTuneTicker.Stop()
+					return
+				}
+			}
+		}()
+	}
+}
+
+// StopAutoTuning menghentikan proses auto-tuning pada PoolManager
+func (pm *PoolManager) StopAutoTuning() {
+	if pm.autoTuneTicker != nil {
+		// Kirim sinyal untuk menghentikan auto-tuning
+		pm.autoTuneStop <- struct{}{}
+		// Hentikan ticker dan tutup channel autoTuneStop
+		close(pm.autoTuneStop)
+		pm.autoTuneTicker.Stop()
+		pm.autoTuneTicker = nil
+		pm.autoTuneStop = make(chan struct{}) // Inisialisasi kembali untuk penggunaan di masa mendatang
+		pm.logger.Println("Auto-tuning stopped")
+	} else {
+		pm.logger.Println("Auto-tuning is not running")
+	}
+}
+
+func (pm *PoolManager) autoTunePoolSize() {
+	pm.pools.Range(func(key, value interface{}) bool {
+		poolType := key.(string)
+		pm.safelyUpdateMetadata(poolType, func(metadata *PoolItemMetadata) {
+			metadata.Status = "Tuning"
+		})
+
+		configVal, _ := pm.poolConfig.Load(poolType)
+		conf, ok := configVal.(PoolConfig)
+		if !ok {
+			return true
+		}
+		if conf.AutoTune {
+			// Logika untuk menambah atau mengurangi ukuran pool
+			currentSize := int32(pm.getCurrentUsage(poolType)) // Pastikan currentSize bertipe int32
+			if currentSize > int32(conf.MaxSize) {
+				// Kurangi ukuran pool
+				pm.ResizePool(poolType, conf.MaxSize)
+			} else if currentSize < int32(conf.InitialSize) {
+				// Tambah ukuran pool
+				pm.ResizePool(poolType, conf.InitialSize)
+			}
+		}
+		return true
+	})
+}
+
+func (pm *PoolManager) ResizePool(poolType string, newSize int) {
+	// Ambil konfigurasi pool saat ini
+	poolVal, ok := pm.pools.Load(poolType)
+	if !ok {
+		pm.logger.Printf("Pool %s does not exist, cannot resize", poolType)
+		return
+	}
+
+	configVal, _ := pm.poolConfig.Load(poolType)
+	conf, ok := configVal.(PoolConfig)
+	if !ok {
+		pm.logger.Printf("Invalid pool configuration for %s", poolType)
+		return
+	}
+
+	// Cek apakah sharding diaktifkan
+	if conf.ShardingEnabled && conf.ShardCount > 1 {
+		// Mengubah ukuran sharded pool
+		shardedPools, ok := poolVal.([]*sync.Pool)
+		if !ok {
+			pm.logger.Printf("Invalid sharded pool type for %s", poolType)
+			return
+		}
+
+		for i := 0; i < len(shardedPools); i++ {
+			currentSize := pm.getShardCurrentSize(poolType, i)
+			if currentSize < newSize {
+				// Tambah objek ke shard untuk mencapai ukuran baru
+				for j := currentSize; j < newSize; j++ {
+					instance := pm.createInstance(poolType)
+					shardedPools[i].Put(instance)
+				}
+			} else if currentSize > newSize {
+				// Kurangi objek dari shard untuk mencapai ukuran baru
+				for j := currentSize; j > newSize; j-- {
+					shardedPools[i].Get() // Ambil dan buang objek
+				}
+			}
+		}
+	} else {
+		// Mengubah ukuran non-sharded pool
+		nonShardedPool, ok := poolVal.(*sync.Pool)
+		if !ok {
+			pm.logger.Printf("Invalid non-sharded pool type for %s", poolType)
+			return
+		}
+
+		currentSize := pm.getPoolCurrentSize(poolType)
+		if currentSize < newSize {
+			// Tambah objek ke pool untuk mencapai ukuran baru
+			for i := currentSize; i < newSize; i++ {
+				instance := pm.createInstance(poolType)
+				nonShardedPool.Put(instance)
+			}
+		} else if currentSize > newSize {
+			// Kurangi objek dari pool untuk mencapai ukuran baru
+			for i := currentSize; i > newSize; i-- {
+				nonShardedPool.Get() // Ambil dan buang objek
+			}
+		}
+	}
+
+	pm.logger.Printf("Resizing pool %s to new size: %d", poolType, newSize)
+}
+
+func (pm *PoolManager) createInstance(poolType string) PoolAble {
+	factoryVal, _ := pm.instanceFactories.Load(poolType)
+	factory, ok := factoryVal.(func() PoolAble)
+	if !ok {
+		pm.logger.Printf("Invalid factory for pool type %s", poolType)
+		return nil
+	}
+	return factory()
+}
+
+func (pm *PoolManager) getPoolCurrentSize(poolType string) int {
+	size := 0
+	// Hitung jumlah objek di pool
+	pm.cache.Range(func(key, value interface{}) bool {
+		if key.(string) == poolType {
+			size++
+		}
+		return true
+	})
+	return size
+}
+
+func (pm *PoolManager) getShardCurrentSize(poolType string, shardIndex int) int {
+	// Ambil pool dan konfigurasinya
+	poolVal, ok := pm.pools.Load(poolType)
+	if !ok {
+		pm.logger.Printf("Pool %s does not exist", poolType)
+		return 0
+	}
+
+	configVal, _ := pm.poolConfig.Load(poolType)
+	conf, ok := configVal.(PoolConfig)
+	if !ok || !conf.ShardingEnabled || conf.ShardCount <= shardIndex {
+		pm.logger.Printf("Invalid configuration for shard %d of pool %s", shardIndex, poolType)
+		return 0
+	}
+
+	// Ambil sharded pool
+	shardedPools, ok := poolVal.([]*sync.Pool)
+	if !ok || len(shardedPools) <= shardIndex {
+		pm.logger.Printf("Invalid sharded pool type for %s", poolType)
+		return 0
+	}
+
+	// Dapatkan ukuran cache yang sesuai dengan shardIndex
+	size := 0
+	pm.cache.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok && keyStr == poolType {
+			if shardVal, ok := value.(int); ok && shardVal == shardIndex {
+				size++
+			}
+		}
+		return true
+	})
+	return size
 }

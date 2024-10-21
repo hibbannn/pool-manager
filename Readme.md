@@ -16,7 +16,7 @@
 Untuk menggunakan package ini, silakan unduh melalui Go modules:
 
 ```bash
-go get github.com/hibbannn/poolmanager
+go get github.com/hibbannn/pool-manager
 ```
 
 ## Pool Configuration Guide
@@ -177,7 +177,7 @@ import (
     "fmt"
     "sync"
     "time"
-    "github.com/hibbannn/poolmanager/pkg"
+    "github.com/hibbannn/pool-manager"
 )
 
 // LargeObject adalah contoh struct yang mengimplementasikan interface PoolAble

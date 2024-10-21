@@ -60,7 +60,10 @@ func (pm *PoolManager) GetMetrics(poolType string) (PoolMetrics, error) {
 func (pm *PoolManager) recordMetric(poolType, action string) {
 	// Memastikan metrik sudah ada, jika tidak, buat baru
 	metricsVal, _ := pm.metrics.LoadOrStore(poolType, &PoolMetrics{})
-	metrics := metricsVal.(*PoolMetrics)
+	metrics, ok := metricsVal.(*PoolMetrics)
+	if !ok {
+		return
+	}
 
 	// Memperbarui metrik secara atomik
 	switch action {
@@ -83,6 +86,9 @@ func (pm *PoolManager) getCurrentUsage(poolType string) int32 {
 	if !ok {
 		return 0
 	}
-	metrics := metricsVal.(*PoolMetrics)
+	metrics, ok := metricsVal.(*PoolMetrics)
+	if !ok {
+		return 0
+	}
 	return metrics.CurrentUsage
 }

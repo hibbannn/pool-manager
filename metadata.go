@@ -20,28 +20,21 @@ type PoolItemMetadata struct {
 // penggunaan, dan durasi penggunaan berdasarkan waktu yang telah berlalu sejak
 // terakhir kali item digunakan.
 func (pm *PoolManager) UpdateItemMetadata(key string) {
-	// Ambil metadata item, atau buat metadata baru jika belum ada
-	metadata, loaded := pm.itemMetadata.LoadOrStore(key, &PoolItemMetadata{
-		LastUsed:     time.Now(),
-		Frequency:    0,
-		CreationTime: time.Now(),
-		Status:       "Active",
+	pm.safelyUpdateMetadata(key, func(itemMeta *PoolItemMetadata) {
+		// Jika status item tidak aktif, tidak perlu memperbarui metadata lebih jauh
+		if itemMeta.Status == "Evicted" {
+			return
+		}
+
+		// Hitung waktu yang berlalu sejak terakhir kali item digunakan
+		elapsed := time.Since(itemMeta.LastUsed)
+		itemMeta.UsageDuration += elapsed
+
+		// Perbarui informasi metadata
+		itemMeta.LastUsed = time.Now()
+		itemMeta.Frequency++
+		itemMeta.Status = "Active"
 	})
-	itemMeta := metadata.(*PoolItemMetadata)
-
-	if !loaded {
-		// Jika metadata baru saja dibuat, tidak perlu memperbarui lebih jauh
-		return
-	}
-
-	// Hitung waktu yang berlalu sejak terakhir kali item digunakan
-	elapsed := time.Since(itemMeta.LastUsed)
-	itemMeta.UsageDuration += elapsed
-
-	// Perbarui informasi metadata
-	itemMeta.LastUsed = time.Now()
-	itemMeta.Frequency++
-	pm.itemMetadata.Store(key, itemMeta)
 }
 
 // safelyUpdateMetadata memperbarui metadata item secara aman menggunakan fungsi pembaruan yang diberikan
@@ -56,7 +49,11 @@ func (pm *PoolManager) safelyUpdateMetadata(key string, updateFunc func(*PoolIte
 		LastUsed:     time.Now(),
 		Status:       "Active",
 	})
-	metadata := metadataVal.(*PoolItemMetadata)
+	metadata, ok := metadataVal.(*PoolItemMetadata)
+	// Pastikan metadata ditemukan
+	if !ok {
+		return
+	}
 
 	// Terapkan fungsi pembaruan yang diberikan pada metadata
 	updateFunc(metadata)
