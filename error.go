@@ -7,8 +7,8 @@ import "strings"
 // dalam pengelolaan pool, termasuk kesalahan saat pool tidak ditemukan atau tidak valid.
 const (
 	ErrPoolDoesNotExist          = "pool does not exist: "           // Error untuk pool yang tidak ditemukan
-	ErrInvalidShardedPoolType    = "pool is not sharded as expected" // Error untuk tipe pool yang tidak sesuai dengan sharding
-	ErrInvalidNonShardedPoolType = "pool is not a valid sync.Pool"   // Error untuk pool yang bukan tipe sync.Pool
+	ErrInvalidShardedPoolName    = "pool is not sharded as expected" // Error untuk tipe pool yang tidak sesuai dengan sharding
+	ErrInvalidNonShardedPoolName = "pool is not a valid sync.Pool"   // Error untuk pool yang bukan tipe sync.Pool
 	ErrInvalidPoolConfigType     = "invalid pool config type"        // Error untuk konfigurasi pool yang tidak valid
 	ErrInvalidFactoryType        = "invalid factory type"            // Error untuk tipe factory yang tidak valid
 )
@@ -16,9 +16,22 @@ const (
 // PoolError adalah tipe error khusus yang digunakan untuk mencatat kesalahan pada operasi PoolManager
 // PoolError menyimpan informasi tentang tipe pool, operasi yang gagal, dan error asli yang menyebabkan kegagalan.
 type PoolError struct {
-	PoolType  string // Tipe pool tempat kesalahan terjadi
+	PoolName  string // Tipe pool tempat kesalahan terjadi
 	Operation string // Operasi yang gagal dijalankan
 	Err       error  // Error asli yang menyebabkan kegagalan
+}
+
+// NewPoolError membuat instance PoolError baru dengan informasi tentang poolName, operasi, dan error yang terjadi
+// poolName: tipe pool yang menyebabkan kesalahan
+// operation: nama operasi yang menyebabkan kesalahan (misalnya "add", "get", atau "put")
+// err: error asli yang menyebabkan kegagalan
+// Fungsi ini mengembalikan pointer ke PoolError yang baru dibuat.
+func NewPoolError(poolName, operation string, err error) *PoolError {
+	return &PoolError{
+		PoolName:  poolName,
+		Operation: operation,
+		Err:       err,
+	}
 }
 
 // Error mengimplementasikan interface error dan mengembalikan pesan kesalahan yang lebih terperinci
@@ -26,7 +39,7 @@ type PoolError struct {
 func (e *PoolError) Error() string {
 	var sb strings.Builder
 	sb.WriteString("pool error: ")
-	sb.WriteString(e.PoolType)
+	sb.WriteString(e.PoolName)
 	sb.WriteString(" during ")
 	sb.WriteString(e.Operation)
 	sb.WriteString(" operation: ")
@@ -39,29 +52,4 @@ func (e *PoolError) Error() string {
 // dengan menggunakan fungsi errors.Unwrap().
 func (e *PoolError) Unwrap() error {
 	return e.Err
-}
-
-// NewPoolError membuat instance PoolError baru dengan informasi tentang poolType, operasi, dan error yang terjadi
-// poolType: tipe pool yang menyebabkan kesalahan
-// operation: nama operasi yang menyebabkan kesalahan (misalnya "add", "get", atau "put")
-// err: error asli yang menyebabkan kegagalan
-// Fungsi ini mengembalikan pointer ke PoolError yang baru dibuat.
-func NewPoolError(poolType, operation string, err error) *PoolError {
-	return &PoolError{
-		PoolType:  poolType,
-		Operation: operation,
-		Err:       err,
-	}
-}
-
-// handleError memanggil callback OnError pada PoolConfig jika error terjadi
-// poolType: tipe pool tempat kesalahan terjadi
-// err: error yang terjadi selama operasi
-// Jika konfigurasi pool memiliki callback OnError, fungsi ini akan memanggil callback tersebut
-// dengan parameter poolType dan error yang terjadi.
-func (pm *PoolManager) handleError(poolType string, err error) {
-	config, _ := pm.poolConfig.Load(poolType)
-	if conf, ok := config.(PoolConfig); ok && conf.OnError != nil {
-		conf.OnError(poolType, err)
-	}
 }
