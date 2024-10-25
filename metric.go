@@ -37,18 +37,36 @@ type MonitoringConfig struct {
 	EnableLogging     bool                 // Menentukan apakah logging diaktifkan
 	LogFunc           func(message string) // Fungsi untuk mencatat log
 	CustomMetricsFunc MetricsCallback      // Fungsi untuk mencatat metrik secara kustom
+	LogLevel          LogLevel
+	OnEvent           func(event PoolEvent)
 }
 
-// GetMetrics memungkinkan pengguna untuk mendapatkan metrik pool saat ini
-// poolType: tipe pool yang ingin diperiksa metriknya
-// Mengembalikan objek PoolMetrics yang berisi informasi metrik pool, atau error
-// jika metrik untuk tipe pool tersebut tidak ditemukan.
-func (pm *PoolManager) GetMetrics(poolType string) (PoolMetrics, error) {
-	metricsVal, ok := pm.metrics.Load(poolType)
-	if !ok {
-		return PoolMetrics{}, errors.New("metrics not found for pool: " + poolType)
+type EventType int
+
+const (
+	EventAcquire EventType = iota
+	EventRelease
+	EventEvict
+)
+
+type PoolEvent struct {
+	Type     EventType
+	PoolName string
+	Item     interface{}
+}
+
+func (pm *PoolManager) triggerEvent(event PoolEvent) {
+	if pm.monitoringConfig.OnEvent != nil {
+		pm.monitoringConfig.OnEvent(event)
 	}
-	return *(metricsVal.(*PoolMetrics)), nil
+}
+
+// GetPoolUsage mengakses metrik penggunaan pool secara langsung dari sync.Map.
+func (pm *PoolManager) GetPoolUsage(poolType string) (int32, error) {
+	if metrics, ok := pm.metrics.Load(poolType); ok {
+		return metrics.(PoolMetrics).CurrentUsage, nil
+	}
+	return 0, errors.New("metrics not found for pool: " + poolType)
 }
 
 // recordMetric mencatat metrik penggunaan pool
@@ -91,4 +109,30 @@ func (pm *PoolManager) getCurrentUsage(poolType string) int32 {
 		return 0
 	}
 	return metrics.CurrentUsage
+}
+
+// getShardSize menghitung ukuran dari shard tertentu dalam sync.Pool
+func (pm *PoolManager) getShardSize(poolType string, shardIndex int) int {
+	size := 0
+	pm.cache.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok && keyStr == poolType {
+			if shardVal, ok := value.(int); ok && shardVal == shardIndex {
+				size++
+			}
+		}
+		return true
+	})
+	return size
+}
+
+// getNonShardedPoolSize mengambil ukuran pool non-sharded di sync.Pool
+func (pm *PoolManager) getNonShardedPoolSize(poolType string) int {
+	size := 0
+	pm.cache.Range(func(key, value interface{}) bool {
+		if keyStr, ok := key.(string); ok && keyStr == poolType {
+			size++
+		}
+		return true
+	})
+	return size
 }

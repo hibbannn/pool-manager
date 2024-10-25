@@ -1,6 +1,8 @@
 package poolmanager
 
-import "time"
+import (
+	"time"
+)
 
 // EvictionPolicy interface untuk kebijakan eviksi
 // EvictionPolicy mendefinisikan metode ShouldEvict, yang digunakan untuk menentukan
@@ -11,6 +13,24 @@ type EvictionPolicy interface {
 	// metadata: metadata dari objek yang digunakan untuk mengevaluasi kebijakan eviksi
 	// Mengembalikan nilai true jika objek harus dieviksikan, false jika tidak.
 	ShouldEvict(key string, metadata *PoolItemMetadata) bool
+
+	// Evict mengevaluasi apakah objek harus dieviksikan
+	// poolType: tipe pool dari mana item akan dihapus
+	// Fungsi ini mencari item dengan waktu terakhir digunakan paling lama dan menghapusnya dari cache dan metadata.
+	Evict(poolType string, pm *PoolManager)
+}
+
+// Implementasi Evict untuk SmartEvictionPolicy
+func (p *SmartEvictionPolicy) Evict(poolType string, pm *PoolManager) {
+	pm.itemMetadata.Range(func(key, value interface{}) bool {
+		if metadata, ok := value.(*PoolItemMetadata); ok && p.ShouldEvict(key.(string), metadata) {
+			// Evict jika kebijakan terpenuhi
+			pm.cache.Delete(key)
+			pm.itemMetadata.Delete(key)
+			pm.logger.Printf("Evicted item from pool: %s, Key: %s, LastUsed: %s", poolType, key, metadata.LastUsed)
+		}
+		return true
+	})
 }
 
 // SmartEvictionPolicy menggabungkan kebijakan eviksi berbasis TTL, LRU, dan LFU
@@ -30,6 +50,12 @@ type SmartEvictionPolicy struct {
 // - Waktu idle melebihi MaxIdleTime
 // - Frekuensi penggunaan kurang dari MinFrequency
 func (p *SmartEvictionPolicy) ShouldEvict(key string, metadata *PoolItemMetadata) bool {
+	// Jika key memiliki awalan "keep-", jangan evict objek tersebut
+	if len(key) >= 5 && key[:5] == "keep-" {
+		return false
+	}
+
+	// Logika eviksi berdasarkan kebijakan TTL, MaxIdleTime, atau MinFrequency
 	return (p.TTL > 0 && time.Since(metadata.LastUsed) > p.TTL) ||
 		(p.MaxIdleTime > 0 && time.Since(metadata.LastUsed) > p.MaxIdleTime) ||
 		(p.MinFrequency > 0 && metadata.Frequency < p.MinFrequency)
@@ -38,7 +64,26 @@ func (p *SmartEvictionPolicy) ShouldEvict(key string, metadata *PoolItemMetadata
 // TTLEvictionPolicy mengimplementasikan kebijakan eviksi berdasarkan TTL
 // Kebijakan ini akan menghapus objek yang sudah tidak digunakan dalam jangka waktu tertentu.
 type TTLEvictionPolicy struct {
-	TTL time.Duration // Batas waktu TTL untuk objek
+	TTL time.Duration // Batas waktu TTL untuk objek yang dieviksikan
+}
+
+// Evict mengevaluasi apakah objek harus dieviksikan
+// poolType: tipe pool dari mana item akan dihapus
+// Fungsi ini mencari item dengan TTL terakhir digunakan paling lama dan menghapusnya dari cache dan metadata.
+func (p *TTLEvictionPolicy) Evict(poolType string, pm *PoolManager) {
+	pm.itemMetadata.Range(func(key, value interface{}) bool {
+		// Evaluasi kebijakan eviksi
+		if metadata, ok := value.(*PoolItemMetadata); ok && p.ShouldEvict(key.(string), metadata) {
+			// Hapus item dari cache dan metadata jika kebijakan eviksi terpenuhi
+			pm.cache.Delete(key)
+			pm.itemMetadata.Delete(key)
+
+			// Tambahkan log dengan menggunakan key dan poolType
+			pm.logger.Printf("Evicted item from pool: %s, Key: %s, LastUsed: %s, Frequency: %d",
+				poolType, key, metadata.LastUsed, metadata.Frequency)
+		}
+		return true
+	})
 }
 
 // ShouldEvict mengevaluasi apakah objek harus dieviksikan berdasarkan TTL
@@ -53,6 +98,10 @@ func (p *TTLEvictionPolicy) ShouldEvict(key string, metadata *PoolItemMetadata) 
 // Kebijakan ini akan menghapus objek yang sudah tidak digunakan dalam jangka waktu tertentu.
 type LRUEvictionPolicy struct {
 	MaxIdleTime time.Duration // Batas waktu idle untuk objek
+}
+
+func (p *LRUEvictionPolicy) Evict(poolType string, pm *PoolManager) {
+	// Tidak ada item yang dieviksikan
 }
 
 // ShouldEvict mengevaluasi apakah objek harus dieviksikan berdasarkan waktu terakhir digunakan
@@ -75,33 +124,4 @@ type LFUEvictionPolicy struct {
 // Mengembalikan nilai true jika frekuensi penggunaan objek kurang dari MinFrequency.
 func (p *LFUEvictionPolicy) ShouldEvict(key string, metadata *PoolItemMetadata) bool {
 	return metadata.Frequency < p.MinFrequency
-}
-
-// evictOldestCacheItem menghapus item cache tertua atau yang paling jarang digunakan
-// poolType: tipe pool dari mana item akan dihapus
-// Fungsi ini mencari item dengan waktu terakhir digunakan paling lama dan menghapusnya dari cache dan metadata.
-func (pm *PoolManager) evictOldestCacheItem(poolType string) {
-	// Menggunakan metadata untuk mencari item dengan waktu terakhir digunakan paling lama
-	var oldestKey string
-	var oldestTime time.Time
-
-	// Iterasi melalui item metadata untuk poolType
-	pm.itemMetadata.Range(func(key, value interface{}) bool {
-		if itemMeta, ok := value.(*PoolItemMetadata); ok {
-			// Pastikan key sesuai dengan poolType
-			if k, ok := key.(string); ok && k == poolType {
-				if oldestTime.IsZero() || itemMeta.LastUsed.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = itemMeta.LastUsed
-				}
-			}
-		}
-		return true
-	})
-
-	// Jika ditemukan item untuk dihapus, hapus dari cache dan metadata
-	if oldestKey != "" {
-		pm.cache.Delete(oldestKey)
-		pm.itemMetadata.Delete(oldestKey)
-	}
 }
